@@ -11,6 +11,8 @@ from isaaclab.controllers.pink_ik.pink_ik import PinkIKController
 from isaaclab.controllers.pink_ik.pink_ik_cfg import PinkIKControllerCfg
 from isaaclab.utils import configclass
 
+from .arm_vector_task import ArmSegmentVectorTask
+
 
 @configclass
 class ESROBOPinkIKControllerCfg(PinkIKControllerCfg):
@@ -127,6 +129,7 @@ class ESROBOPinkIKController(PinkIKController):
         )
         joint_positions_pink = command_state_full_joint_positions[self.isaac_lab_to_pink_ordering]
         self.pink_configuration.update(joint_positions_pink)
+        self._update_arm_vector_targets()
 
         if self._task_errors_within_tolerance():
             target_joint_pos = torch.tensor(
@@ -211,3 +214,20 @@ class ESROBOPinkIKController(PinkIKController):
             )
 
         return target_joint_pos
+
+    def _update_arm_vector_targets(self) -> None:
+        """Refresh segment-vector targets from the frame targets set by the action term."""
+        frame_positions: dict[str, np.ndarray] = {}
+        all_tasks = self.cfg.variable_input_tasks + self.cfg.fixed_input_tasks
+        for task in all_tasks:
+            frame = getattr(task, "frame", None)
+            transform = getattr(task, "transform_target_to_base", None)
+            if frame is not None and transform is not None:
+                frame_positions[str(frame)] = np.asarray(
+                    transform.translation, dtype=np.float64
+                ).copy()
+        for task in all_tasks:
+            if isinstance(task, ArmSegmentVectorTask):
+                task.update_target_from_frame_positions(
+                    frame_positions, self.pink_configuration
+                )

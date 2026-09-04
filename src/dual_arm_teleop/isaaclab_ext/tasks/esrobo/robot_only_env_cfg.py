@@ -56,6 +56,20 @@ def _env_vec3(name: str, default: tuple[float, float, float]) -> tuple[float, fl
     return values
 
 
+def _env_axis_order(
+    name: str, default: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    values = tuple(int(value) for value in raw.replace(",", " ").split())
+    if sorted(values) != [0, 1, 2]:
+        raise ValueError(
+            f"{name} must be a permutation of 0, 1, 2, got {values} from {raw!r}"
+        )
+    return values
+
+
 @configclass
 class FixedBaseBimanualIKESROBORobotOnlySceneCfg(InteractiveSceneCfg):
     """Scene with ESROBO, a ground plane, and a light for teleoperation bring-up."""
@@ -259,11 +273,14 @@ class FixedBaseBimanualIKESROBORobotOnlyEnvCfg(ManagerBasedRLEnvCfg):
                     hand_imu_left_local_axis_signs=_env_vec3(
                         "ESROBO_HAND_IMU_LEFT_LOCAL_AXIS_SIGNS", (-1.0, -1.0, 1.0)
                     ),
+                    hand_imu_left_axis_order=_env_axis_order(
+                        "ESROBO_HAND_IMU_LEFT_AXIS_ORDER", (2, 0, 1)
+                    ),
                     hand_imu_right_local_axis_signs=_env_vec3(
                         "ESROBO_HAND_IMU_RIGHT_LOCAL_AXIS_SIGNS", (-1.0, 1.0, 1.0)
                     ),
                     hand_imu_right_swap_xy=_env_bool(
-                        "ESROBO_HAND_IMU_RIGHT_SWAP_XY", True
+                        "ESROBO_HAND_IMU_RIGHT_SWAP_XY", False
                     ),
                     initial_left_wrist_pose=ESROBO_INITIAL_LEFT_WRIST_POSE_W,
                     initial_right_wrist_pose=ESROBO_INITIAL_RIGHT_WRIST_POSE_W,

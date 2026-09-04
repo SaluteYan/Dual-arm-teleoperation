@@ -232,6 +232,9 @@ class UdpBimanualBodyDevice(DeviceBase):
         self._hand_imu_left_local_axis_signs = np.asarray(
             cfg.hand_imu_left_local_axis_signs, dtype=np.float32
         ).reshape(3)
+        self._hand_imu_left_axis_order = np.asarray(
+            cfg.hand_imu_left_axis_order, dtype=np.int64
+        ).reshape(3)
         self._hand_imu_right_local_axis_signs = np.asarray(
             cfg.hand_imu_right_local_axis_signs, dtype=np.float32
         ).reshape(3)
@@ -245,10 +248,16 @@ class UdpBimanualBodyDevice(DeviceBase):
                     f"hand_imu_{side}_local_axis_signs must contain only +1 or -1, "
                     f"got {signs.tolist()}"
                 )
+        if sorted(self._hand_imu_left_axis_order.tolist()) != [0, 1, 2]:
+            raise ValueError(
+                "hand_imu_left_axis_order must be a permutation of 0, 1, 2, "
+                f"got {self._hand_imu_left_axis_order.tolist()}"
+            )
         print(
             "[bodytracking_udp] Real SenseGlove IMU local axis signs: "
             f"left={self._hand_imu_left_local_axis_signs.tolist()} "
             f"right={self._hand_imu_right_local_axis_signs.tolist()}; "
+            f"left_axis_order={self._hand_imu_left_axis_order.tolist()}; "
             f"right_swap_xy={self._hand_imu_right_swap_xy}.",
             flush=True,
         )
@@ -386,8 +395,14 @@ class UdpBimanualBodyDevice(DeviceBase):
         self._hand_skeleton_positions: dict[str, np.ndarray] = {}
         self._hand_skeleton_frame = "source"
         self._hand_orientation_delta_matrices: dict[str, np.ndarray] = {}
+        self._hand_orientation_is_forearm_relative = False
+        self._hand_orientation_sample_times_s: dict[str, float] = {}
         self._hand_arm_reference_rotations: dict[str, np.ndarray] = {}
         self._hand_imu_reference_delta_matrices: dict[str, np.ndarray] = {}
+        self._wrist_arm_reference_rotations: dict[str, np.ndarray] = {}
+        self._hand_skeleton_arm_reference_rotations: dict[str, np.ndarray] = {}
+        self._hand_skeleton_visual_rotations: dict[str, np.ndarray] = {}
+        self._forearm_plane_normals: dict[str, np.ndarray] = {}
         self._previous_action = self._make_action(
             self._previous_left_pose,
             self._previous_right_pose,
@@ -692,6 +707,11 @@ class UdpBimanualBodyDevice(DeviceBase):
         self._held_segment_directions = {"left": {}, "right": {}}
         self._hand_arm_reference_rotations.clear()
         self._hand_imu_reference_delta_matrices.clear()
+        self._wrist_arm_reference_rotations.clear()
+        self._hand_skeleton_arm_reference_rotations.clear()
+        self._hand_skeleton_visual_rotations.clear()
+        self._hand_orientation_sample_times_s.clear()
+        self._forearm_plane_normals.clear()
         if hasattr(self, "_markers") and not self._cfg.visualize_during_calibration:
             self._markers.set_visibility(False)
         if hasattr(self, "_hand_skeleton_markers"):
@@ -1336,6 +1356,8 @@ class UdpBimanualBodyDevice(DeviceBase):
                     hand_orientation_deltas,
                     hand_skeleton_positions,
                     packet_time_s,
+                    hand_orientation_sample_times_s,
+                    hand_orientation_is_forearm_relative,
                 ) = self._parse_packet(payload)
             except Exception as exc:
                 logger.warning("Failed to parse body-tracking UDP packet: %s", exc)
@@ -1385,6 +1407,12 @@ class UdpBimanualBodyDevice(DeviceBase):
 
             if hand_orientation_deltas:
                 self._hand_orientation_delta_matrices.update(hand_orientation_deltas)
+                self._hand_orientation_is_forearm_relative = (
+                    hand_orientation_is_forearm_relative
+                )
+                self._hand_orientation_sample_times_s.update(
+                    hand_orientation_sample_times_s
+                )
                 self._last_hand_orientation_sender = sender
                 self._last_hand_orientation_packet_time_monotonic = time.monotonic()
                 self._printed_hand_imu_stale = False
@@ -1450,6 +1478,8 @@ class UdpBimanualBodyDevice(DeviceBase):
         dict[str, np.ndarray],
         dict[str, np.ndarray],
         float | None,
+        dict[str, float],
+        bool,
     ]:
         message = json.loads(payload.decode("utf-8"))
         if not isinstance(message, dict):
@@ -1477,7 +1507,32 @@ class UdpBimanualBodyDevice(DeviceBase):
             self._parse_hand_orientation_deltas(message),
             self._parse_hand_skeleton_positions(message),
             _body_packet_time_seconds(message),
+            self._parse_hand_orientation_sample_times(message),
+            bool(message.get("hand_orientation_is_forearm_relative", False)),
         )
+
+    @staticmethod
+    def _parse_hand_orientation_sample_times(
+        message: dict[str, Any]
+    ) -> dict[str, float]:
+        raw = message.get("hand_orientation_sample_monotonic_ns")
+        if not isinstance(raw, dict):
+            packet_time = _body_packet_time_seconds(message)
+            return (
+                {side: packet_time for side in ("left", "right")}
+                if packet_time is not None
+                else {}
+            )
+        parsed: dict[str, float] = {}
+        for side in ("left", "right"):
+            value = raw.get(side)
+            if value is None:
+                continue
+            try:
+                parsed[side] = float(value) / 1.0e9
+            except (TypeError, ValueError):
+                continue
+        return parsed
 
     def _parse_hand_skeleton_positions(
         self, message: dict[str, Any]
@@ -1542,6 +1597,29 @@ class UdpBimanualBodyDevice(DeviceBase):
         if raw_deltas is None:
             raw_deltas = message.get("hand_orientation_delta")
 
+        axis_calibrated = bool(message.get("hand_orientation_axis_calibrated", False))
+        absolute = message.get("hand_orientations_absolute")
+        neutral = message.get("hand_orientation_neutral")
+        if (
+            not axis_calibrated
+            and isinstance(absolute, dict)
+            and isinstance(neutral, dict)
+        ):
+            raw_deltas = {}
+            for side in ("left", "right"):
+                if side not in absolute or side not in neutral:
+                    continue
+                current_quat = self._parse_hand_orientation_quat(
+                    absolute[side], message
+                )
+                neutral_quat = self._parse_hand_orientation_quat(
+                    neutral[side], message
+                )
+                raw_deltas[side] = _matrix_to_quat_wxyz(
+                    _quat_wxyz_to_matrix(current_quat)
+                    @ _quat_wxyz_to_matrix(neutral_quat).T
+                )
+
         sides: dict[str, Any] = {}
         if isinstance(raw_deltas, dict):
             for side in ("left", "right"):
@@ -1566,6 +1644,19 @@ class UdpBimanualBodyDevice(DeviceBase):
         for side, raw_quat in sides.items():
             quat = self._parse_hand_orientation_quat(raw_quat, message)
             source_rotation_delta = _quat_wxyz_to_matrix(quat)
+            initial_rotation = (
+                self._initial_left_pose_matrix[:3, :3]
+                if side == "left"
+                else self._initial_right_pose_matrix[:3, :3]
+            )
+            if axis_calibrated:
+                robot_rotation_delta = (
+                    initial_rotation
+                    @ source_rotation_delta
+                    @ initial_rotation.T
+                )
+                orientation_deltas[side] = robot_rotation_delta.astype(np.float32)
+                continue
             robot_rotation_delta = (
                 self._hand_imu_source_to_robot_rotation
                 @ source_rotation_delta
@@ -1577,18 +1668,15 @@ class UdpBimanualBodyDevice(DeviceBase):
                     if side == "left"
                     else self._hand_imu_right_local_axis_signs
                 )
-                initial_rotation = (
-                    self._initial_left_pose_matrix[:3, :3]
-                    if side == "left"
-                    else self._initial_right_pose_matrix[:3, :3]
-                )
                 local_rotation_delta = (
                     initial_rotation.T
                     @ robot_rotation_delta
                     @ initial_rotation
                 )
                 local_rotvec = _rotation_matrix_to_rotvec(local_rotation_delta)
-                if side == "right" and self._hand_imu_right_swap_xy:
+                if side == "left":
+                    local_rotvec = local_rotvec[self._hand_imu_left_axis_order]
+                elif self._hand_imu_right_swap_xy:
                     local_rotvec[[0, 1]] = local_rotvec[[1, 0]]
                 local_rotvec *= local_axis_signs
                 local_rotation_delta = _rotvec_to_rotation_matrix(local_rotvec)
@@ -1892,6 +1980,11 @@ class UdpBimanualBodyDevice(DeviceBase):
         disabled.
         """
         rotation_delta = self._hand_imu_delta_matrix_for_target(target_side)
+        synchronized_arm_rotation = self._synchronized_human_forearm_rotation(
+            target_side
+        )
+        if synchronized_arm_rotation is not None:
+            current_arm_rotation = synchronized_arm_rotation
         if (
             rotation_delta is None
             or not self._hand_imu_relative_to_arm_frame
@@ -1912,7 +2005,67 @@ class UdpBimanualBodyDevice(DeviceBase):
 
         parent_delta_world = current_arm_rotation @ arm_reference.T
         hand_delta_world = rotation_delta @ imu_reference.T
+        if self._hand_orientation_is_forearm_relative:
+            return hand_delta_world.astype(np.float32)
         return (parent_delta_world.T @ hand_delta_world).astype(np.float32)
+
+    def _synchronized_human_forearm_rotation(
+        self, target_side: str
+    ) -> np.ndarray | None:
+        """Build the human forearm frame nearest the corresponding IMU sample."""
+        sample_time = self._hand_orientation_sample_times_s.get(target_side)
+        source_side = self._source_side_for_target(target_side)
+        points = (
+            self._interpolated_arm_points_at_time(source_side, sample_time)
+            if sample_time is not None
+            else None
+        )
+        if points is None:
+            points = self._current_arm_points(source_side)
+        if points is None:
+            return None
+        points = _arm_points_relative_to_shoulder(points, self._position_delta_signs)
+        key = f"imu_{target_side}"
+        rotation = _forearm_points_to_rotation(
+            points, self._forearm_plane_normals.get(key)
+        )
+        if rotation is not None:
+            self._forearm_plane_normals[key] = rotation[:, 2].copy()
+        return rotation
+
+    def _interpolated_arm_points_at_time(
+        self, source_side: str, sample_time: float
+    ) -> dict[str, np.ndarray] | None:
+        """Interpolate body arm positions onto a hand-IMU sample timestamp."""
+        history = list(self._body_frame_history)
+        if not history:
+            return None
+        before = [sample for sample in history if sample[0] <= sample_time]
+        after = [sample for sample in history if sample[0] >= sample_time]
+        if before and after:
+            before_time, before_frames = before[-1]
+            after_time, after_frames = after[0]
+            if after_time - before_time <= 0.10:
+                before_points = self._arm_points_from_frames(
+                    before_frames, source_side
+                )
+                after_points = self._arm_points_from_frames(after_frames, source_side)
+                if before_points is not None and after_points is not None:
+                    denominator = max(after_time - before_time, 1.0e-9)
+                    alpha = float(np.clip((sample_time - before_time) / denominator, 0.0, 1.0))
+                    return {
+                        name: (
+                            (1.0 - alpha) * before_points[name]
+                            + alpha * after_points[name]
+                        ).astype(np.float32)
+                        for name in ("shoulder", "elbow", "wrist")
+                    }
+        nearest_time, nearest_frames = min(
+            history, key=lambda sample: abs(sample[0] - sample_time)
+        )
+        if abs(nearest_time - sample_time) > 0.25:
+            return None
+        return self._arm_points_from_frames(nearest_frames, source_side)
 
     def _compose_wrist_rotation(
         self,
@@ -1922,22 +2075,38 @@ class UdpBimanualBodyDevice(DeviceBase):
         """Combine the arm-parent frame with the hand's IMU-relative rotation."""
         if target_side == "left":
             initial_rotation = self._initial_left_pose_matrix[:3, :3]
-            reference_arm_rotation = self._robot_left_forearm_reference_rotation
         else:
             initial_rotation = self._initial_right_pose_matrix[:3, :3]
-            reference_arm_rotation = self._robot_right_forearm_reference_rotation
 
-        current_arm_rotation = (
-            _forearm_points_to_rotation(target_arm_points)
-            if target_arm_points is not None
-            else None
-        )
+        current_arm_rotation = None
+        if target_arm_points is not None:
+            key = f"target_{target_side}"
+            current_arm_rotation = _forearm_points_to_rotation(
+                target_arm_points, self._forearm_plane_normals.get(key)
+            )
+            if current_arm_rotation is not None:
+                self._forearm_plane_normals[key] = current_arm_rotation[:, 2].copy()
         rotation_delta = self._hand_imu_delta_matrix_for_target(target_side)
+
+        arm_mounting_reference = self._wrist_arm_reference_rotations.get(
+            target_side
+        )
+        if current_arm_rotation is not None and arm_mounting_reference is None:
+            arm_mounting_reference = current_arm_rotation.copy()
+            self._wrist_arm_reference_rotations[target_side] = arm_mounting_reference
+
+        arm_follow_rotation = initial_rotation.copy()
+        if current_arm_rotation is not None and arm_mounting_reference is not None:
+            arm_follow_rotation = (
+                current_arm_rotation
+                @ arm_mounting_reference.T
+                @ initial_rotation
+            ).astype(np.float32)
 
         relative_rotation_world = self._hand_imu_relative_rotation_world(
             target_side, current_arm_rotation
         )
-        if relative_rotation_world is not None and reference_arm_rotation is not None:
+        if relative_rotation_world is not None and arm_mounting_reference is not None:
             arm_reference = self._hand_arm_reference_rotations[target_side]
             relative_rotation_local = (
                 arm_reference.T @ relative_rotation_world @ arm_reference
@@ -1945,22 +2114,16 @@ class UdpBimanualBodyDevice(DeviceBase):
             return (
                 current_arm_rotation
                 @ relative_rotation_local
-                @ reference_arm_rotation.T
+                @ arm_mounting_reference.T
                 @ initial_rotation
             ).astype(np.float32)
 
         if rotation_delta is not None:
             return (rotation_delta @ initial_rotation).astype(np.float32)
 
-        if (
-            not self._hand_orientation_inherit_arm_frame
-            or current_arm_rotation is None
-            or reference_arm_rotation is None
-        ):
+        if not self._hand_orientation_inherit_arm_frame:
             return initial_rotation.copy().astype(np.float32)
-        return (
-            current_arm_rotation @ reference_arm_rotation.T @ initial_rotation
-        ).astype(np.float32)
+        return arm_follow_rotation
 
     def _retarget_arm_vector_pair(
         self, source_side: str, target_side: str
@@ -1995,12 +2158,6 @@ class UdpBimanualBodyDevice(DeviceBase):
             if source_side == "left"
             else self._auto_reference_right_arm_points
         )
-        auto_reference_wrist_matrix = (
-            self._auto_reference_left_wrist_matrix
-            if source_side == "left"
-            else self._auto_reference_right_wrist_matrix
-        )
-
         if self._requires_calibration:
             calibration_points = (
                 self._down_left_arm_points
@@ -2178,7 +2335,7 @@ class UdpBimanualBodyDevice(DeviceBase):
         vector: np.ndarray,
         deadband_deg: float,
     ) -> np.ndarray:
-        """Hold a segment direction until its cumulative angular change exceeds the deadband."""
+        """Suppress tiny jitter while retaining a continuous response to real motion."""
         direction = _normalize_vector(vector)
         if direction is None:
             return vector
@@ -2190,7 +2347,12 @@ class UdpBimanualBodyDevice(DeviceBase):
             cosine = float(np.clip(np.dot(previous_direction, direction), -1.0, 1.0))
             angular_change_deg = float(np.degrees(np.arccos(cosine)))
             if angular_change_deg < deadband_deg:
-                return previous_direction
+                blend = float(np.clip(angular_change_deg / deadband_deg, 0.08, 1.0))
+                blended = _normalize_vector(
+                    (1.0 - blend) * previous_direction + blend * direction
+                )
+                if blended is not None:
+                    direction = blended
 
         self._held_segment_directions[target_side][segment_name] = direction.copy()
         return direction
@@ -2363,6 +2525,53 @@ class UdpBimanualBodyDevice(DeviceBase):
             return (rotation_delta @ mounting).astype(np.float32)
         return mounting.astype(np.float32)
 
+    def _attached_hand_skeleton_rotation(
+        self,
+        side: str,
+        body_arm_points: dict[str, np.ndarray],
+        initial_mounting_rotation: np.ndarray,
+    ) -> np.ndarray:
+        """Follow the displayed forearm while preserving the initial hand mounting."""
+        key = f"visual_{side}"
+        current_arm_rotation = _forearm_points_to_rotation(
+            body_arm_points, self._forearm_plane_normals.get(key)
+        )
+        if current_arm_rotation is None:
+            return initial_mounting_rotation.astype(np.float32)
+        self._forearm_plane_normals[key] = current_arm_rotation[:, 2].copy()
+
+        arm_reference = self._hand_skeleton_arm_reference_rotations.get(side)
+        if arm_reference is None:
+            arm_reference = current_arm_rotation.copy()
+            self._hand_skeleton_arm_reference_rotations[side] = arm_reference
+
+        relative_rotation_world = self._hand_imu_relative_rotation_world(
+            side, current_arm_rotation
+        )
+        if relative_rotation_world is not None:
+            imu_arm_reference = self._hand_arm_reference_rotations.get(side)
+            if imu_arm_reference is not None:
+                relative_rotation_local = (
+                    imu_arm_reference.T
+                    @ relative_rotation_world
+                    @ imu_arm_reference
+                )
+                return (
+                    current_arm_rotation
+                    @ relative_rotation_local
+                    @ arm_reference.T
+                    @ initial_mounting_rotation
+                ).astype(np.float32)
+
+        rotation = (
+            current_arm_rotation @ arm_reference.T @ initial_mounting_rotation
+        )
+        if not self._hand_imu_relative_to_arm_frame:
+            rotation_delta = self._hand_imu_delta_matrix_for_target(side)
+            if rotation_delta is not None:
+                rotation = rotation_delta @ rotation
+        return rotation.astype(np.float32)
+
     def _visualize_hand_skeletons(self) -> None:
         translations: list[torch.Tensor] = []
         orientations: list[torch.Tensor] = []
@@ -2384,6 +2593,18 @@ class UdpBimanualBodyDevice(DeviceBase):
         )
         for side, joint_marker, bone_marker in (("left", 0, 2), ("right", 1, 3)):
             local_points, edges, uses_sgcore_points = self._senseglove_hand_points(side)
+            if (
+                side == "left"
+                and uses_sgcore_points
+                and self._hand_skeleton_frame == "robot_hand_local"
+            ):
+                # SGCore's two physical hands are chiral. The bridge already aligns
+                # their axes for retargeting, so restore the left-hand reflection
+                # only for display before mounting it on the mirrored robot wrist.
+                local_points = {
+                    name: np.asarray([-point[0], point[1], point[2]], dtype=np.float32)
+                    for name, point in local_points.items()
+                }
             initial_pose = (
                 self._initial_left_pose_matrix
                 if side == "left"
@@ -2425,13 +2646,10 @@ class UdpBimanualBodyDevice(DeviceBase):
                         body_points.get(f"{other_side}_wrist"),
                     )
                 if rotation is None and len(body_arm_points) == 3:
-                    target_wrist_rotation = self._compose_wrist_rotation(
-                        side, body_arm_points
-                    )
-                    rotation = (
-                        target_wrist_rotation
-                        @ initial_pose[:3, :3].T
-                        @ hand_visual_reference_rotation
+                    rotation = self._attached_hand_skeleton_rotation(
+                        side,
+                        body_arm_points,
+                        hand_visual_reference_rotation,
                     )
                 if rotation is None:
                     rotation = hand_visual_reference_rotation
@@ -2441,6 +2659,7 @@ class UdpBimanualBodyDevice(DeviceBase):
                 rotation_delta = self._hand_imu_delta_matrix_for_target(side)
                 if rotation_delta is not None:
                     rotation = rotation_delta @ rotation
+            self._hand_skeleton_visual_rotations[side] = rotation.copy()
             local_wrist = local_points.get(
                 "wrist", np.zeros(3, dtype=np.float32)
             )
@@ -2928,6 +3147,26 @@ class UdpBimanualBodyDevice(DeviceBase):
                     f" left_elbow_pos={np.round(left_elbow_pose[:3], 4).tolist()} "
                     f"right_elbow_pos={np.round(right_elbow_pose[:3], 4).tolist()}"
                 )
+            skeleton_text = ""
+            if self._hand_skeleton_visual_rotations:
+                skeleton_forwards = {
+                    side: np.round(
+                        rotation @ np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
+                        4,
+                    ).tolist()
+                    for side, rotation in self._hand_skeleton_visual_rotations.items()
+                }
+                skeleton_palms = {
+                    side: np.round(
+                        rotation @ np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
+                        4,
+                    ).tolist()
+                    for side, rotation in self._hand_skeleton_visual_rotations.items()
+                }
+                skeleton_text = (
+                    f" hand_skeleton_forwards={skeleton_forwards}"
+                    f" hand_skeleton_palms={skeleton_palms}"
+                )
             print(
                 "[bodytracking_udp debug] "
                 f"frame={self._debug_frame} sender={self._last_sender} age={age:.3f}s frames=[{names}] "
@@ -2938,6 +3177,7 @@ class UdpBimanualBodyDevice(DeviceBase):
                 f" left_quat={np.round(left_pose[3:], 4).tolist()}"
                 f" right_quat={np.round(right_pose[3:], 4).tolist()}"
                 f"{elbow_text}",
+                f"{skeleton_text}",
                 flush=True,
             )
         self._debug_frame += 1
@@ -3168,6 +3408,7 @@ def _arm_points_to_rotation(points: dict[str, np.ndarray]) -> np.ndarray | None:
 
 def _forearm_points_to_rotation(
     points: dict[str, np.ndarray],
+    previous_plane_normal: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Build the wrist parent frame from the forearm axis and elbow bend plane."""
     forearm_axis = _normalize_vector(points["wrist"] - points["elbow"])
@@ -3178,6 +3419,11 @@ def _forearm_points_to_rotation(
     plane_normal = None
     if upper_arm_axis is not None:
         plane_normal = _normalize_vector(np.cross(upper_arm_axis, forearm_axis))
+    if plane_normal is None and previous_plane_normal is not None:
+        plane_normal = _normalize_vector(
+            previous_plane_normal
+            - float(np.dot(previous_plane_normal, forearm_axis)) * forearm_axis
+        )
     if plane_normal is None:
         for reference in (
             np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
@@ -3189,6 +3435,8 @@ def _forearm_points_to_rotation(
                 break
     if plane_normal is None:
         return None
+    if previous_plane_normal is not None and np.dot(plane_normal, previous_plane_normal) < 0.0:
+        plane_normal = -plane_normal
 
     bend_axis = _normalize_vector(np.cross(forearm_axis, plane_normal))
     if bend_axis is None:
@@ -3318,8 +3566,9 @@ class UdpBimanualBodyDeviceCfg(DeviceCfg):
         tuple[float, float, float, float, float, float, float, float, float] | None
     ) = None
     hand_imu_left_local_axis_signs: tuple[float, float, float] = (-1.0, -1.0, 1.0)
+    hand_imu_left_axis_order: tuple[int, int, int] = (2, 0, 1)
     hand_imu_right_local_axis_signs: tuple[float, float, float] = (-1.0, 1.0, 1.0)
-    hand_imu_right_swap_xy: bool = True
+    hand_imu_right_swap_xy: bool = False
     source_to_robot_rotation: tuple[
         float, float, float, float, float, float, float, float, float
     ] = (

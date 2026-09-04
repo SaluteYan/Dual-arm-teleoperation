@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -31,6 +32,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--print-interval", type=float, default=1.0)
+    parser.add_argument(
+        "--hand-imu-mode",
+        choices=("relative", "synchronized", "disabled"),
+        default="relative",
+        help=(
+            "Interpret a separately recorded glove IMU as wrist-relative motion, "
+            "use synchronized for a hand stream captured with the same body motion, "
+            "or disable hand orientation entirely."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -116,15 +127,68 @@ def _select(
     return events
 
 
+def _quat_multiply_wxyz(left: list[float], right: list[float]) -> list[float]:
+    lw, lx, ly, lz = (float(value) for value in left)
+    rw, rx, ry, rz = (float(value) for value in right)
+    result = [
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    ]
+    norm = math.sqrt(sum(value * value for value in result))
+    return [value / norm for value in result] if norm > 1.0e-9 else [1.0, 0.0, 0.0, 0.0]
+
+
 def _replay_packet(
-    packet: dict[str, Any], sequence: int, loop_index: int, stream: str
+    packet: dict[str, Any],
+    sequence: int,
+    loop_index: int,
+    stream: str,
+    hand_imu_neutral: dict[str, list[float]] | None,
+    hand_imu_mode: str = "relative",
 ) -> dict[str, Any]:
     replay = dict(packet)
     replay["replay_sequence"] = sequence
     replay["replay_loop"] = loop_index
     replay["replay_stream"] = stream
     replay["replay_timestamp"] = time.time()
-    replay["replay_sender_monotonic_ns"] = time.monotonic_ns()
+    replay_time_ns = time.monotonic_ns()
+    replay["replay_sender_monotonic_ns"] = replay_time_ns
+    if stream == "hand" and hand_imu_mode == "disabled":
+        for key in (
+            "hand_orientation_deltas",
+            "hand_orientations_absolute",
+            "hand_orientation_neutral",
+            "hand_orientation_sample_monotonic_ns",
+            "hand_orientation_axis_calibrated",
+        ):
+            replay.pop(key, None)
+    elif stream == "hand":
+        replay["hand_orientation_is_forearm_relative"] = (
+            hand_imu_mode == "relative"
+        )
+
+    if stream == "hand" and hand_imu_mode != "disabled" and hand_imu_neutral:
+        deltas = replay.get("hand_orientation_deltas")
+        if isinstance(deltas, dict):
+            absolute: dict[str, list[float]] = {}
+            neutral: dict[str, list[float]] = {}
+            sample_times: dict[str, int] = {}
+            for side in ("left", "right"):
+                delta = deltas.get(side)
+                neutral_quat = hand_imu_neutral.get(side)
+                if not isinstance(delta, list) or not isinstance(neutral_quat, list):
+                    continue
+                if len(delta) != 4 or len(neutral_quat) != 4:
+                    continue
+                absolute[side] = _quat_multiply_wxyz(delta, neutral_quat)
+                neutral[side] = [float(value) for value in neutral_quat]
+                sample_times[side] = replay_time_ns
+            if absolute:
+                replay["hand_orientations_absolute"] = absolute
+                replay["hand_orientation_neutral"] = neutral
+                replay["hand_orientation_sample_monotonic_ns"] = sample_times
     return replay
 
 
@@ -134,6 +198,7 @@ def _send_loop(
     args: argparse.Namespace,
     loop_index: int,
     sequence: int,
+    hand_imu_neutral: dict[str, list[float]] | None,
 ) -> int:
     start = time.perf_counter()
     next_print = start + max(args.print_interval, 0.0)
@@ -144,7 +209,14 @@ def _send_loop(
         delay = target - time.perf_counter()
         if delay > 0.0:
             time.sleep(delay)
-        replay = _replay_packet(packet, sequence, loop_index, stream_name)
+        replay = _replay_packet(
+            packet,
+            sequence,
+            loop_index,
+            stream_name,
+            hand_imu_neutral,
+            args.hand_imu_mode,
+        )
         sock.sendto(
             json.dumps(replay, separators=(",", ":")).encode("utf-8"),
             (args.host, args.port),
@@ -172,6 +244,13 @@ def main(argv: list[str]) -> int:
         hand_header, hand_packets = _load_packets(
             args.hand_record_path.expanduser(), "hand"
         )
+        hand_imu_neutral = None
+        if isinstance(hand_header, dict):
+            calibration = hand_header.get("calibration")
+            if isinstance(calibration, dict) and isinstance(
+                calibration.get("imu_neutral"), dict
+            ):
+                hand_imu_neutral = calibration["imu_neutral"]
         body_start_offset = (
             args.start_offset
             if args.body_start_offset is None
@@ -216,7 +295,8 @@ def main(argv: list[str]) -> int:
         "[esrobo_arm_hand_replay] "
         f"events={len(events)} body={body_event_count} hand={hand_event_count} "
         f"duration={duration_s:.3f}s speed={args.speed:.3f} "
-        f"destination={args.host}:{args.port} synthetic_hand={bool(hand_header and hand_header.get('synthetic'))}",
+        f"destination={args.host}:{args.port} hand_imu_mode={args.hand_imu_mode} "
+        f"synthetic_hand={bool(hand_header and hand_header.get('synthetic'))}",
         flush=True,
     )
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -224,7 +304,9 @@ def main(argv: list[str]) -> int:
     loop_index = 0
     try:
         while True:
-            sequence = _send_loop(sock, events, args, loop_index, sequence)
+            sequence = _send_loop(
+                sock, events, args, loop_index, sequence, hand_imu_neutral
+            )
             loop_index += 1
             if not args.loop:
                 break

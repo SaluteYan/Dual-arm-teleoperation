@@ -11,8 +11,9 @@ export ESROBO_HAND_ONLY_MODE=1
 export ESROBO_USE_HAND_IMU_ORIENTATION=1
 export ESROBO_HAND_IMU_MAX_STALE_TIME_S="${ESROBO_HAND_IMU_MAX_STALE_TIME_S:-0.5}"
 export ESROBO_HAND_IMU_LEFT_LOCAL_AXIS_SIGNS="${ESROBO_HAND_IMU_LEFT_LOCAL_AXIS_SIGNS:--1 -1 1}"
+export ESROBO_HAND_IMU_LEFT_AXIS_ORDER="${ESROBO_HAND_IMU_LEFT_AXIS_ORDER:-2 0 1}"
 export ESROBO_HAND_IMU_RIGHT_LOCAL_AXIS_SIGNS="${ESROBO_HAND_IMU_RIGHT_LOCAL_AXIS_SIGNS:--1 1 1}"
-export ESROBO_HAND_IMU_RIGHT_SWAP_XY="${ESROBO_HAND_IMU_RIGHT_SWAP_XY:-1}"
+export ESROBO_HAND_IMU_RIGHT_SWAP_XY="${ESROBO_HAND_IMU_RIGHT_SWAP_XY:-0}"
 export ESROBO_ENABLE_ELBOW_IK_TASKS=0
 export ESROBO_WRIST_ONLY_IK=1
 export ESROBO_BODY_REQUIRE_CALIBRATION=0
@@ -33,9 +34,8 @@ export ESROBO_IK_STATIC_TARGET_ORIENTATION_ERROR_RAD="${ESROBO_IK_STATIC_TARGET_
 echo "Starting ESROBO SenseGlove-only hand and wrist teleoperation."
 echo "No PICO/XRoboToolkit body stream is required."
 echo "Arm joints 1-4 stay locked; wrist joints 5-7 follow calibrated Nova 2 IMU orientation."
-echo "Left IMU local axis signs: ${ESROBO_HAND_IMU_LEFT_LOCAL_AXIS_SIGNS}."
-echo "Right IMU local axis signs: ${ESROBO_HAND_IMU_RIGHT_LOCAL_AXIS_SIGNS}."
-echo "Right IMU swap local X/Y: ${ESROBO_HAND_IMU_RIGHT_SWAP_XY}."
+echo "Live packets use fixed Nova 2 glove axes plus a mandatory per-run IMU neutral pose."
+echo "Legacy static receiver settings are used only for recordings or packets without calibrated-axis metadata."
 echo "Glove measurements drive the 20 active hand joints; wrist translation is not controlled."
 echo
 

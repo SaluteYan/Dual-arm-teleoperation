@@ -23,6 +23,7 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+mono_crash.mem.*.blob
 
 # ---- editor / OS ----
 .vscode/

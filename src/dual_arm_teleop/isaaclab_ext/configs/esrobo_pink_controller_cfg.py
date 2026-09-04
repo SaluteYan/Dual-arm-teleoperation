@@ -22,7 +22,7 @@ from dual_arm_teleop.isaaclab_ext.assets.esrobo import (
     ESROBO_URDF_MESH_PATH,
     ESROBO_URDF_PATH,
 )
-from dual_arm_teleop.isaaclab_ext.controllers import ESROBOPinkIKControllerCfg
+from dual_arm_teleop.isaaclab_ext.controllers import ArmSegmentVectorTask, ESROBOPinkIKControllerCfg
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -67,6 +67,12 @@ ESROBO_IK_ELBOW_POSITION_COST = float(os.environ.get("ESROBO_IK_ELBOW_POSITION_C
 ESROBO_IK_ELBOW_ORIENTATION_COST = float(os.environ.get("ESROBO_IK_ELBOW_ORIENTATION_COST", "0.0"))
 ESROBO_IK_ELBOW_FRAME_TASK_GAIN = float(os.environ.get("ESROBO_IK_ELBOW_FRAME_TASK_GAIN", "1.0"))
 ESROBO_IK_ELBOW_FRAME_TASK_LM_DAMPING = float(os.environ.get("ESROBO_IK_ELBOW_FRAME_TASK_LM_DAMPING", "0.006"))
+ESROBO_IK_ARM_VECTOR_TASKS = _env_bool("ESROBO_IK_ARM_VECTOR_TASKS", True)
+ESROBO_IK_UPPER_ARM_VECTOR_COST = float(os.environ.get("ESROBO_IK_UPPER_ARM_VECTOR_COST", "36.0"))
+ESROBO_IK_FOREARM_VECTOR_COST = float(os.environ.get("ESROBO_IK_FOREARM_VECTOR_COST", "48.0"))
+ESROBO_IK_ARM_VECTOR_TASK_GAIN = float(os.environ.get("ESROBO_IK_ARM_VECTOR_TASK_GAIN", "1.0"))
+ESROBO_IK_ARM_VECTOR_LM_DAMPING = float(os.environ.get("ESROBO_IK_ARM_VECTOR_LM_DAMPING", "0.008"))
+ESROBO_IK_ARM_VECTOR_HUBER_DELTA = float(os.environ.get("ESROBO_IK_ARM_VECTOR_HUBER_DELTA", "0.04"))
 ESROBO_IK_NULLSPACE_POSTURE_COST = float(os.environ.get("ESROBO_IK_NULLSPACE_POSTURE_COST", "0.001"))
 ESROBO_IK_NULLSPACE_POSTURE_GAIN = float(os.environ.get("ESROBO_IK_NULLSPACE_POSTURE_GAIN", "0.001"))
 ESROBO_IK_NULLSPACE_POSTURE_LM_DAMPING = float(
@@ -156,6 +162,38 @@ def _make_variable_input_tasks() -> list:
             _make_frame_task(ESROBO_LEFT_HAND_FRAME_NAME, ESROBO_IK_POSITION_COST, ESROBO_IK_ORIENTATION_COST),
             _make_frame_task(ESROBO_RIGHT_HAND_FRAME_NAME, ESROBO_IK_POSITION_COST, ESROBO_IK_ORIENTATION_COST),
         ]
+
+    if ESROBO_ENABLE_ELBOW_IK_TASKS and ESROBO_IK_ARM_VECTOR_TASKS and not ESROBO_WRIST_ONLY_IK:
+        for side, elbow_frame, hand_frame in (
+            ("left", ESROBO_LEFT_ELBOW_FRAME_NAME, ESROBO_LEFT_HAND_FRAME_NAME),
+            ("right", ESROBO_RIGHT_ELBOW_FRAME_NAME, ESROBO_RIGHT_HAND_FRAME_NAME),
+        ):
+            frame_tasks.extend(
+                [
+                    ArmSegmentVectorTask(
+                        origin_frame=f"{side}_nero_link1",
+                        task_frame=elbow_frame,
+                        base_link_frame_name=ESROBO_BASE_LINK_NAME,
+                        target_task_frame=elbow_frame,
+                        target_origin_frame=None,
+                        cost=ESROBO_IK_UPPER_ARM_VECTOR_COST,
+                        gain=ESROBO_IK_ARM_VECTOR_TASK_GAIN,
+                        lm_damping=ESROBO_IK_ARM_VECTOR_LM_DAMPING,
+                        huber_delta=ESROBO_IK_ARM_VECTOR_HUBER_DELTA,
+                    ),
+                    ArmSegmentVectorTask(
+                        origin_frame=elbow_frame,
+                        task_frame=hand_frame,
+                        base_link_frame_name=ESROBO_BASE_LINK_NAME,
+                        target_task_frame=hand_frame,
+                        target_origin_frame=elbow_frame,
+                        cost=ESROBO_IK_FOREARM_VECTOR_COST,
+                        gain=ESROBO_IK_ARM_VECTOR_TASK_GAIN,
+                        lm_damping=ESROBO_IK_ARM_VECTOR_LM_DAMPING,
+                        huber_delta=ESROBO_IK_ARM_VECTOR_HUBER_DELTA,
+                    ),
+                ]
+            )
 
     if not ESROBO_WRIST_ONLY_IK:
         frame_tasks.append(
