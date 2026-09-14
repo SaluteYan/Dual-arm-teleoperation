@@ -1,0 +1,152 @@
+diff --git a/senseglove/senseglove_bringup/config/gloves.yaml b/senseglove/senseglove_bringup/config/gloves.yaml
+index a3485b5..e10a9ba 100644
+--- a/senseglove/senseglove_bringup/config/gloves.yaml
++++ b/senseglove/senseglove_bringup/config/gloves.yaml
+@@ -6,9 +6,9 @@
+ gloves:
+   - type: nova2
+     side: left
+-    serial: "01001"
++    serial: "00885"
+     finger_distance: false
+   - type: nova2
+     side: right
+-    serial: "01002"
+-    finger_distance: false
+\ No newline at end of file
++    serial: "00892"
++    finger_distance: false
+diff --git a/senseglove/senseglove_control/senseglove_hardware/include/senseglove_hardware/senseglove_robot.hpp b/senseglove/senseglove_control/senseglove_hardware/include/senseglove_hardware/senseglove_robot.hpp
+index ac3b18c..3957caf 100644
+--- a/senseglove/senseglove_control/senseglove_hardware/include/senseglove_hardware/senseglove_robot.hpp
++++ b/senseglove/senseglove_control/senseglove_hardware/include/senseglove_hardware/senseglove_robot.hpp
+@@ -41,7 +41,7 @@ public:
+     Unknown
+   };
+
+-  static constexpr int TOTAL_FINGER_JOINTS = 19;
++  static constexpr int TOTAL_FINGER_JOINTS = 20;
+   static constexpr int NUM_FINGERS = 5;
+   static constexpr int JOINTS_PER_FINGER = 4;
+   static constexpr int DISTAL_JOINT_INDEX = 3;
+@@ -220,4 +220,4 @@ private:
+
+ }  // namespace SGHardware
+
+-#endif  // SENSEGLOVE_HARDWARE_SENSEGLOVE_ROBOT_HPP
+\ No newline at end of file
++#endif  // SENSEGLOVE_HARDWARE_SENSEGLOVE_ROBOT_HPP
+diff --git a/senseglove/senseglove_control/senseglove_hardware_interface/src/senseglove_hardware_interface.cpp b/senseglove/senseglove_control/senseglove_hardware_interface/src/senseglove_hardware_interface.cpp
+index e617c19..d93ceb8 100644
+--- a/senseglove/senseglove_control/senseglove_hardware_interface/src/senseglove_hardware_interface.cpp
++++ b/senseglove/senseglove_control/senseglove_hardware_interface/src/senseglove_hardware_interface.cpp
+@@ -216,44 +216,54 @@ return_type SenseGloveHardwareInterface::read(const rclcpp::Time&, const rclcpp:
+ {
+   const auto dt = std::chrono::duration<double>(period.seconds());
+
+-  if (!robot_->updateGloveData(dt))
+-    return return_type::OK;
+-
+-  // Update joint states
+-  for (size_t j = 0; j < glove_data_.num_joints; ++j)
++  try
+   {
+-    auto& joint = robot_->getJoint(j);
+-    glove_data_.joint_position[j] = joint.getPosition();
+-    glove_data_.joint_velocity[j] = joint.getVelocity();
+-    glove_data_.joint_effort[j] = joint.getTorque();
+-  }
++    if (!robot_->updateGloveData(dt))
++      return return_type::OK;
+
+-  // Update hand positions
+-  for (size_t h = 0; h < glove_data_.hand_xyz.size(); ++h)
+-  {
+-    const auto pos = robot_->getHandPosition(static_cast<int>(h));
+-    glove_data_.hand_xyz[h][0] = pos.GetX();
+-    glove_data_.hand_xyz[h][1] = pos.GetY();
+-    glove_data_.hand_xyz[h][2] = pos.GetZ();
+-  }
++    // Update joint states
++    for (size_t j = 0; j < glove_data_.num_joints; ++j)
++    {
++      auto& joint = robot_->getJoint(j);
++      glove_data_.joint_position[j] = joint.getPosition();
++      glove_data_.joint_velocity[j] = joint.getVelocity();
++      glove_data_.joint_effort[j] = joint.getTorque();
++    }
+
+-  // Update fingertip positions
+-  for (size_t f = 0; f < glove_data_.tip_xyz.size(); ++f)
+-  {
+-    const auto tip = robot_->getFingerTip(static_cast<int>(f));
+-    glove_data_.tip_xyz[f][0] = tip.GetX();
+-    glove_data_.tip_xyz[f][1] = tip.GetY();
+-    glove_data_.tip_xyz[f][2] = tip.GetZ();
+-  }
++    // Update hand positions
++    for (size_t h = 0; h < glove_data_.hand_xyz.size(); ++h)
++    {
++      const auto pos = robot_->getHandPosition(static_cast<int>(h));
++      glove_data_.hand_xyz[h][0] = pos.GetX();
++      glove_data_.hand_xyz[h][1] = pos.GetY();
++      glove_data_.hand_xyz[h][2] = pos.GetZ();
++    }
+
+-  // Update IMU
+-  SGCore::Kinematics::Quat q;
+-  if (robot_->getImuRotation(q))
++    // Update fingertip positions
++    for (size_t f = 0; f < glove_data_.tip_xyz.size(); ++f)
++    {
++      const auto tip = robot_->getFingerTip(static_cast<int>(f));
++      glove_data_.tip_xyz[f][0] = tip.GetX();
++      glove_data_.tip_xyz[f][1] = tip.GetY();
++      glove_data_.tip_xyz[f][2] = tip.GetZ();
++    }
++
++    // SGCore may throw while parsing a transient malformed SenseCom frame.
++    SGCore::Kinematics::Quat q;
++    if (robot_->getImuRotation(q))
++    {
++      glove_data_.imu_quat[0] = q.GetX();
++      glove_data_.imu_quat[1] = q.GetY();
++      glove_data_.imu_quat[2] = q.GetZ();
++      glove_data_.imu_quat[3] = q.GetW();
++    }
++  }
++  catch (const std::exception& e)
+   {
+-    glove_data_.imu_quat[0] = q.GetX();
+-    glove_data_.imu_quat[1] = q.GetY();
+-    glove_data_.imu_quat[2] = q.GetZ();
+-    glove_data_.imu_quat[3] = q.GetW();
++    static rclcpp::Clock throttle_clock(RCL_STEADY_TIME);
++    RCLCPP_WARN_THROTTLE(
++      logger_, throttle_clock, 2000,
++      "Discarding malformed SenseGlove frame and keeping the previous state: %s", e.what());
+   }
+
+   return return_type::OK;
+diff --git a/senseglove/senseglove_description/rviz/urdf_both.rviz b/senseglove/senseglove_description/rviz/urdf_both.rviz
+index aec89f1..24f60a9 100644
+--- a/senseglove/senseglove_description/rviz/urdf_both.rviz
++++ b/senseglove/senseglove_description/rviz/urdf_both.rviz
+@@ -61,7 +61,7 @@ Visualization Manager:
+         Durability Policy: Volatile
+         History Policy: Keep Last
+         Reliability Policy: Reliable
+-        Value: /senseglove/glove1/rh/robot_description
++        Value: /senseglove/glove00892/rh/robot_description
+       Enabled: true
+       Links:
+         All Links Enabled: true
+@@ -211,7 +211,7 @@ Visualization Manager:
+         Durability Policy: Volatile
+         History Policy: Keep Last
+         Reliability Policy: Reliable
+-        Value: /senseglove/glove0/lh/robot_description
++        Value: /senseglove/glove00885/lh/robot_description
+       Enabled: true
+       Links:
+         All Links Enabled: true

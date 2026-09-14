@@ -2,7 +2,7 @@
 
 PICO/XRoboToolkit 全身骨骼追踪 + SenseGlove Nova 2 灵巧手数据，遥操作 **ESROBO 双臂灵巧手机器人** 的代码仓库。
 
-本仓库面向 **实际双臂机器人部署**（实机遥操作），不再依赖 IsaacLab 仿真遥操作。仓库只保留遥操作核心代码与机器人 URDF/网格模型，**不包含**仿真专用 USD 资产、录制数据与第三方外部依赖（依赖按下方说明另行获取/安装）。
+本仓库同时保留实际机器人部署代码与可复现的 IsaacLab 仿真基线。第三方源码仍需按版本清单单独获取；完整 ESROBO USD 资产通过 Git LFS 管理，并提供经过裁剪的 PICO/SenseGlove 成功记录与运行日志。精确版本、哈希和复现命令见 [`reproducibility/README.md`](reproducibility/README.md)。
 
 ## 仓库结构
 
@@ -10,8 +10,9 @@ PICO/XRoboToolkit 全身骨骼追踪 + SenseGlove Nova 2 灵巧手数据，遥�
 src/dual_arm_teleop/isaaclab_ext/  遥操作核心库（UDP 设备、手臂重定向、IK 控制器、动作、机器人资产、任务配置）
 scripts/                            桥接进程与启动脚本（PICO/XRoboToolkit、SenseGlove ROS2、录制/回放、安装器）
 urdf/esrobo_waist_with_head/        ESROBO 机器人 URDF 与网格模型（实机模型，含 base_link.STL 等网格）
-assets/esrobo/                      ESROBO 资产配置（config.yaml、主 USD 入口；configuration/*.usd 仿真资产不纳入本仓库）
+assets/esrobo/                      完整 ESROBO Isaac Sim USD 资产（大文件由 Git LFS 管理）
 config/senseglove_esrobo_calibration.json  SenseGlove 手部标定文件
+reproducibility/                    依赖锁定、环境导出、哈希、成功样本、日志和复现命令
 pyproject.toml                      Python 包元数据
 ```
 
@@ -81,7 +82,7 @@ SenseGlove 左右手是具有相反手性的点云。显示层会额外反射左
 
 ## 大文件说明
 
-`urdf/esrobo_waist_with_head/meshes/base_link.STL`（约 227 MB）超出 GitHub 100 MB 单文件限制，通过 **Git LFS** 管理。克隆后需执行：
+`urdf/esrobo_waist_with_head/meshes/base_link.STL` 和 `assets/esrobo/configuration/esrobo_waist_with_head_base.usd` 均超出 GitHub 100 MB 单文件限制，通过 **Git LFS** 管理。克隆后需执行：
 
 ```bash
 git lfs install

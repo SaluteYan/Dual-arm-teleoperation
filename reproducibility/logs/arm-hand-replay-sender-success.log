@@ -1,0 +1,2 @@
+[esrobo_arm_hand_replay] events=5362 body=2681 hand=2681 duration=29.923s speed=1.000 destination=127.0.0.1:15050 synthetic_hand=True
+[esrobo_arm_hand_replay] done. sent_events=5362

@@ -1,0 +1,120 @@
+Starting ESROBO IsaacLab simulation without XR rendering/streaming.
+Task: DualArmTeleop-ESROBO-RobotOnly-BimanualIK-Abs-v0
+Listening for body-tracking UDP on 0.0.0.0:15050.
+Wrist target mapping swap: ESROBO_BODY_SWAP_LEFT_RIGHT_TARGETS=0.
+Waist-relative body frame: ESROBO_BODY_USE_WAIST_FRAME=0.
+Robot-frame position delta signs: ESROBO_BODY_POSITION_DELTA_SIGNS=1 1 1.
+Body retargeting mode: ESROBO_BODY_RETARGETING_MODE=arm_vector.
+Arm-vector position mode: ESROBO_BODY_ARM_VECTOR_POSITION_MODE=segment_direction_absolute.
+Elbow IK tasks: ESROBO_ENABLE_ELBOW_IK_TASKS=1.
+Wrist-only IK: ESROBO_WRIST_ONLY_IK=0; when enabled, arm joints 1-4 are locked and only joints 5-7 control hand orientation.
+Arm-vector max robot reach: ESROBO_BODY_ARM_VECTOR_MAX_REACH=0.72m.
+Arm-vector prediction: horizon=0.02s, lookback=0.03s, max_velocity=2.5m/s, max_displacement=0.035m.
+Skeleton visualization: ESROBO_BODY_ENABLE_VISUALIZATION=1, offset='0 1.1 1.85', scale=1.0.
+SenseGlove IMU absolute hand orientation: ESROBO_USE_HAND_IMU_ORIENTATION=1, max_stale=0.5s.
+Hand orientation inherits the arm frame when IMU is unavailable: ESROBO_HAND_ORIENTATION_INHERIT_ARM_FRAME=1.
+SenseGlove IMU is interpreted relative to the synchronized arm frame: ESROBO_HAND_IMU_RELATIVE_TO_ARM_FRAME=1.
+SenseGlove-only mode: ESROBO_HAND_ONLY_MODE=0; hand skeleton=1, attach_to_body_wrist=1, fallback_offset='0.55 0 0.18', scale=1.6.
+Body calibration required: ESROBO_BODY_REQUIRE_CALIBRATION=0.
+Body calibration is disabled; absolute arm-vector mode uses live full-body shoulder/elbow/wrist frames directly.
+Absolute segment mode: robot arms follow PICO absolute shoulder->elbow and elbow->wrist directions after source-to-robot rotation.
+Sim/control timing: sim_dt=0.0166666667, decimation=1, render_interval=2, rendering_mode=balanced, anti_aliasing=DLSS, denoiser=true.
+Posture stabilization: upper_arm_deadband=0.25deg, forearm_deadband=0.30deg.
+Teleop response: ik_urdf_velocity_limits=0, ik_delta=0.105, ik_command_lead=0.25, ik_command_step=0.0, ik_static_hold=4frames@1e-6/position_error<=0.01m/orientation_error<=0.05rad, wrist_gain/lm=1.0/0.012, wrist_cost_pos/orient=32.0/0.05, elbow_gain/lm=1.0/0.006, elbow_cost_pos/orient=80.0/0.0, nullspace_cost/gain=0.001/0.001, arm_vel=180.0, arm_effort=3500.0, arm_kd=8800.0/320.0, arm_velocity_ff_gain/max/deadband=0.6/8.0/0.0015, arm_velocity_ff_speed_start/full=0.12/0.75m/s, waist_head_hold_vel/effort=20.0/2500.0, waist_head_hold_kd=8000.0/800.0.
+Verbose teleop debug: xr_data=0 perf=0 eef_error=0 interval=60.
+Kit args: --/persistent/physics/visualizationDisplayJoints=0 --/rtx/post/motionblur/enabled=false --/rtx/post/motionblur/exposureFraction=0 --/rtx/post/motionblur/maxBlurDiameterFraction=0 --/rtx/post/dof/enabled=false --/rtx-transient/dlssg/enabled=false --/rtx-transient/dldenoiser/enabled=true
+Run scripts/run_xrobotoolkit_body_to_esrobo_teleop_bridge.sh in another terminal to provide XRoboToolkit full-body shoulder/elbow/wrist targets.
+Optional: run scripts/run_senseglove_to_esrobo_hand_bridge.sh to provide ESROBO active hand-joint targets and calibrated hand IMU orientation on the same UDP port.
+
+[esrobo_pink] Explicit hand mimic control active: 20 follower joints.
+[INFO] Action Manager:  <ActionManager> contains 1 active terms.
++-----------------------------------+
+|  Active Action Terms (shape: 48)  |
++-------+---------------+-----------+
+| Index | Name          | Dimension |
++-------+---------------+-----------+
+|   0   | upper_body_ik |        48 |
++-------+---------------+-----------+
+
+[INFO] Observation Manager: <ObservationManager> contains 1 groups.
++-----------------------------------------------+
+|  Active Observation Terms in Group: 'policy'  |
++---------+------------------------+------------+
+|  Index  | Name                   |   Shape    |
++---------+------------------------+------------+
+|    0    | actions                |   (48,)    |
+|    1    | robot_joint_pos        |   (59,)    |
+|    2    | robot_root_pos         |    (3,)    |
+|    3    | robot_root_rot         |    (4,)    |
+|    4    | robot_links_state      |  (72, 13)  |
+|    5    | left_eef_pos           |    (3,)    |
+|    6    | left_eef_quat          |    (4,)    |
+|    7    | right_eef_pos          |    (3,)    |
+|    8    | right_eef_quat         |    (4,)    |
+|    9    | hand_joint_state       |   (20,)    |
++---------+------------------------+------------+
+
+[INFO] Termination Manager:  <TerminationManager> contains 0 active terms.
++----------------------------+
+|  Active Termination Terms  |
++--------+-------+-----------+
+| Index  | Name  |  Time Out |
++--------+-------+-----------+
++--------+-------+-----------+
+
+[INFO] Reward Manager:  <RewardManager> contains 0 active terms.
++-----------------------+
+|  Active Reward Terms  |
++-------+------+--------+
+| Index | Name | Weight |
++-------+------+--------+
++-------+------+--------+
+
+[INFO] Curriculum Manager:  <CurriculumManager> contains 0 active terms.
++----------------------+
+| Active Curriculum Terms |
++-----------+----------+
+|   Index   | Name     |
++-----------+----------+
++-----------+----------+
+
+Creating window for environment.
+[INFO]: Completed setting up the environment...
+[teleop] Body-tracking UDP runs without IsaacLab XR rendering. The input device will lock its initial pose after its calibration countdown.
+[bodytracking_udp] Source-to-robot rotation det=1.000 rows=[[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]].
+[bodytracking_udp] Hand-IMU source-to-robot rotation det=1.000 rows=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].
+[bodytracking_udp] Real SenseGlove IMU local axis signs: left=[-1.0, -1.0, 1.0] right=[-1.0, 1.0, 1.0]; right_swap_xy=True.
+[bodytracking_udp] Listening for body-tracking UDP packets on 0.0.0.0:15050.
+[bodytracking_udp] Body calibration disabled. In arm_vector mode, the first fresh full-body shoulder/elbow/wrist packet drives the robot immediately.
+[bodytracking_udp] Wrist target mapping: robot_left<=human_left robot_right<=human_right.
+[bodytracking_udp] Retargeting mode: arm_vector.
+[bodytracking_udp] Arm-vector position mode: segment_direction_absolute.
+[bodytracking_udp] Arm-vector prediction: horizon=0.020s lookback=0.030s max_velocity=2.50m/s max_displacement=0.035m.
+[bodytracking_udp] Arm-segment angular deadband: upper_arm=0.250deg forearm=0.300deg.
+[bodytracking_udp] SenseGlove IMU hand orientation: enabled; PICO/body tracking drives wrist position; only fresh SenseGlove IMU packets drive wrist orientation, otherwise the initial wrist orientation is held.
+[bodytracking_udp] Robot-frame position delta signs: [1.0, 1.0, 1.0].
+[bodytracking_udp] SenseGlove FK hand-skeleton visualization enabled at /Visuals/esrobo_senseglove_hand_skeletons; robot-consistent arm-frame mounting=True; legacy palms-face-each-other mounting=False; left local forward-axis correction=0.0deg.
+Using teleop device: UDP Bimanual Body Tracking Device: UdpBimanualBodyDevice
+	Listen: 0.0.0.0:15050
+	Waist-relative retargeting: False
+	Retargeting mode: arm_vector
+	Arm-vector position mode: segment_direction_absolute
+	Elbow IK targets: True
+	Body calibration required: False
+	Auto startup reference: False
+	Position delta signs: [1.0, 1.0, 1.0]
+	Wrist target mapping: robot_left<=human_left robot_right<=human_right
+	Hand-only mode: False
+	SenseGlove IMU orientation: True
+	Hand joint targets: 20
+	Action dimensions: 48
+2026-08-19T07:17:36Z [46,081ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/esrobo_body_capture_pose.
+2026-08-19T07:17:36Z [46,081ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/esrobo_senseglove_hand_skeletons.
+[bodytracking_udp] Body calibration remains disabled after reset; waiting for fresh full-body shoulder/elbow/wrist packets.
+Teleoperation started. Press 'R' to reset the environment.
+[bodytracking_udp] Waiting for body-tracking packets. Start scripts/run_xrobotoolkit_body_to_esrobo_teleop_bridge.sh for arm-vector retargeting, or send body JSON poses to UDP 0.0.0.0:15050.
+2026-08-19T07:17:43Z [53,161ms] [Warning] [carb] Client gpu.foundation.plugin has acquired [gpu::unstable::IMemoryBudgetManagerFactory v0.1] 100 times. Consider accessing this interface with carb::getCachedInterface() (Performance warning)
+[bodytracking_udp] Receiving hand joint targets (20 values) from ('127.0.0.1', 56491).
+[bodytracking_udp] Receiving calibrated hand IMU orientation deltas for ['left', 'right'] from ('127.0.0.1', 56491).
+[bodytracking_udp] Shoulder/dual-arm skeleton visualization active at /Visuals/esrobo_body_capture_pose; shoulders/elbows/wrists update from live full-body frames when present, with helper estimates filling any missing joints.
+[bodytracking_udp] Packet stream stale for 0.51s; holding previous robot target.

@@ -6,10 +6,12 @@ recordings/
 logs/
 *.jsonl
 
-# ---- simulation-only USD assets (not needed for real-robot deployment) ----
-assets/esrobo/configuration/
-assets/esrobo/esrobo_waist_with_head.usd
-assets/esrobo/.asset_hash
+# Curated, bounded reproducibility evidence is intentionally versioned.
+!reproducibility/
+!reproducibility/logs/
+!reproducibility/logs/*.log
+!reproducibility/samples/
+!reproducibility/samples/*.jsonl
 
 # ---- Python ----
 __pycache__/
