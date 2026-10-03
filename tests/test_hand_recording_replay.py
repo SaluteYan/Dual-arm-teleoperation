@@ -8,7 +8,12 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import replay_esrobo_hand_recording as replay
+import replay_esrobo_hand_recording as replay  # noqa: E402
+import replay_esrobo_arm_hand_recordings as combined  # noqa: E402
+from senseglove_ros_to_esrobo_hand_bridge import (  # noqa: E402
+    apply_imu_axis_calibration, build_fixed_imu_axis_calibration,
+    orientation_delta_local_wxyz,
+)
 
 
 def _raw_side(imu):
@@ -73,3 +78,29 @@ def test_dex_vector_replay_retargets_raw_hands_and_rebuilds_imu():
         "left": [1.0, 0.0, 0.0, 0.0],
         "right": [1.0, 0.0, 0.0, 0.0],
     }
+
+
+def test_combined_legacy_imu_is_rebuilt_from_raw_with_current_fixed_axes():
+    raw = {"left": _raw_side([0.98, 0.1, 0.1, 0.1]),
+           "right": _raw_side([0.98, 0.0, 0.2, 0.0])}
+    neutrals = dict.fromkeys(("left", "right"), [1.0, 0.0, 0.0, 0.0])
+    packet = {"type": "esrobo_hand_joints", "hand_joints": [0.25] * 20,
+              "hand_orientation_deltas": dict.fromkeys(("left", "right"), [1.0, 0.0, 0.0, 0.0])}
+    upgraded = combined._upgrade_hand_imu_packet({"calibration": {"imu_neutral": neutrals}}, packet, raw)
+    axes = build_fixed_imu_axis_calibration()
+    for side in ("left", "right"):
+        local = orientation_delta_local_wxyz(raw[side]["imu_orientation_corrected_wxyz"], neutrals[side])
+        assert upgraded["hand_orientation_deltas"][side] == apply_imu_axis_calibration(local, axes[side], target_side=side)
+    assert upgraded["hand_orientation_axis_calibrated"] is True
+    assert upgraded["hand_joints"] == packet["hand_joints"]
+    assert "hand_orientation_axis_calibrated" not in packet
+    resent = combined._replay_packet(upgraded, 0, 0, "hand", neutrals)
+    # A hand-local delta cannot be used to reconstruct a sensor-world absolute IMU.
+    assert resent["hand_orientations_absolute"] == upgraded["hand_orientations_absolute"]
+
+
+def test_combined_imu_upgrade_preserves_already_calibrated_and_missing_raw_packets():
+    packet = {"hand_orientation_axis_calibrated": True, "hand_joints": [0.0] * 20}
+    assert combined._upgrade_hand_imu_packet({}, packet, {}) is packet
+    packet = {"hand_joints": [0.0] * 20}
+    assert combined._upgrade_hand_imu_packet({}, packet, None) is packet

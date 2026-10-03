@@ -83,6 +83,11 @@ class ESROBOPinkIKController(PinkIKController):
         """Reset the persistent IK command state from measured joints on the next solve."""
         self._commanded_controlled_joint_positions = None
 
+    def hold_command_joints(self, mask: np.ndarray, positions: np.ndarray) -> None:
+        """Keep warm-start state aligned with held joints while the other arm moves."""
+        if self._commanded_controlled_joint_positions is not None:
+            self._commanded_controlled_joint_positions[mask] = positions[mask]
+
     def _clamp_command_lead(self, measured_joint_positions: np.ndarray) -> None:
         """Keep the persistent command state within a bounded lead of measured joints."""
         if self._commanded_controlled_joint_positions is None:

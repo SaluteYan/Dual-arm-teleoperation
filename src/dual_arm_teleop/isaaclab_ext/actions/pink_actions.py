@@ -14,6 +14,7 @@ from dual_arm_teleop.isaaclab_ext.assets.esrobo import (
     ESROBO_RIGHT_ARM_JOINTS,
 )
 from dual_arm_teleop.isaaclab_ext.controllers import ESROBOPinkIKController
+from dual_arm_teleop.pose_stability import PoseTargetStability
 
 
 class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
@@ -153,11 +154,15 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
         )
         self._has_previous_frame_positions = False
         self._static_target_tolerance = max(
-            float(os.environ.get("ESROBO_IK_STATIC_TARGET_TOLERANCE", "1e-6")),
+            float(os.environ.get("ESROBO_IK_STATIC_TARGET_TOLERANCE", "0.003")),
+            0.0,
+        )
+        self._static_target_angular_tolerance = max(
+            float(os.environ.get("ESROBO_IK_STATIC_TARGET_ANGULAR_TOLERANCE_RAD", "0.0174532925")),
             0.0,
         )
         self._static_target_hold_frames = max(
-            int(os.environ.get("ESROBO_IK_STATIC_TARGET_HOLD_FRAMES", "4")),
+            int(os.environ.get("ESROBO_IK_STATIC_TARGET_HOLD_FRAMES", "12")),
             1,
         )
         self._static_target_position_error_tolerance_m = max(
@@ -168,8 +173,11 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
             float(os.environ.get("ESROBO_IK_STATIC_TARGET_ORIENTATION_ERROR_RAD", "0.05")),
             0.0,
         )
-        self._static_target_frame_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._static_target_hold_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._static_target_hold_active = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
+        self._settled_solution_frame_count = torch.zeros((self.num_envs, 2), dtype=torch.long, device=self.device)
+        self._static_joint_tolerance_rad = max(
+            float(os.environ.get("ESROBO_IK_STATIC_JOINT_TOLERANCE_RAD", "0.001")), 0.0,
+        )
         self._cached_ik_joint_positions: torch.Tensor | None = None
         frame_names = [
             str(getattr(task, "frame", ""))
@@ -177,6 +185,19 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
             if getattr(task, "frame", None) is not None
         ]
         self._controlled_frame_body_ids = [self._asset.body_names.index(frame_name) for frame_name in frame_names]
+        frame_tasks = [
+            task for task in self.cfg.controller.variable_input_tasks
+            if getattr(task, "frame", None) is not None
+        ]
+        self._orientation_frame_indices = [
+            index for index, task in enumerate(frame_tasks)
+            if task.cost is not None and bool(torch.any(torch.as_tensor(task.cost).reshape(-1)[-3:] > 0))
+        ]
+        self._pose_stability = PoseTargetStability(
+            [self._frame_indices_by_side[side] for side in ("left", "right")],
+            self._orientation_frame_indices, self._static_target_tolerance,
+            self._static_target_angular_tolerance, self._static_target_hold_frames,
+        )
         self._velocity_feedforward_activation = torch.zeros(
             (self.num_envs, len(self._isaaclab_controlled_joint_ids)),
             device=self.device,
@@ -222,20 +243,10 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
         )
         frame_positions = frame_targets[:, :, : self.position_dim]
         self._velocity_feedforward_activation.zero_()
+        self._stable_arm_targets = self._pose_stability.update(frame_targets)
+        self._static_target_hold_active &= self._stable_arm_targets
 
         if self._has_previous_frame_positions:
-            target_change = torch.amax(
-                torch.abs(frame_targets - self._previous_frame_targets),
-                dim=(1, 2),
-            )
-            target_is_static = target_change <= self._static_target_tolerance
-            # A cached solution is valid only while the complete pose target is unchanged.
-            self._static_target_hold_active &= target_is_static
-            self._static_target_frame_count = torch.where(
-                target_is_static,
-                self._static_target_frame_count + 1,
-                torch.zeros_like(self._static_target_frame_count),
-            )
             target_speed = torch.linalg.norm(
                 frame_positions - self._previous_frame_positions,
                 dim=-1,
@@ -277,10 +288,7 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
             self._num_frame_tasks,
             self.pose_dim,
         )[:, :, self.position_dim :]
-        max_frame_position_error = torch.amax(
-            torch.linalg.norm(target_frame_positions - current_frame_positions, dim=-1),
-            dim=1,
-        )
+        frame_position_errors = torch.linalg.norm(target_frame_positions - current_frame_positions, dim=-1)
         current_frame_quaternions = self._asset.data.body_link_state_w[
             :, self._controlled_frame_body_ids, 3:7
         ]
@@ -290,46 +298,56 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
             torch.sum(current_frame_quaternions * target_frame_quaternions, dim=-1)
         )
         frame_orientation_errors = 2.0 * torch.acos(torch.clamp(quaternion_dots, 0.0, 1.0))
-        max_frame_orientation_error = torch.amax(frame_orientation_errors, dim=1)
-        pose_target_reached = (
-            (max_frame_position_error <= self._static_target_position_error_tolerance_m)
-            & (max_frame_orientation_error <= self._static_target_orientation_error_tolerance_rad)
-        )
-        self._static_target_hold_active &= pose_target_reached
-        can_start_hold = (
-            (self._static_target_frame_count >= self._static_target_hold_frames)
-            & pose_target_reached
-        )
-        if bool(torch.any(can_start_hold)):
-            measured_joint_positions = self._asset.data.joint_pos[:, self._isaaclab_controlled_joint_ids]
+        # Elbow orientation has zero IK cost: it must never prevent wrist hold.
+        for side_index, side in enumerate(("left", "right")):
+            frames = self._frame_indices_by_side[side]
+            if not frames:
+                continue
+            reached = frame_position_errors[:, frames].amax(dim=1) <= self._static_target_position_error_tolerance_m
+            orientation_frames = [i for i in frames if i in self._orientation_frame_indices]
+            if orientation_frames:
+                reached &= frame_orientation_errors[:, orientation_frames].amax(dim=1) <= self._static_target_orientation_error_tolerance_rad
+            # Some poses cannot satisfy all arm-vector, position and orientation
+            # constraints. A converged solution must also be allowed to stop.
+            settled = self._settled_solution_frame_count[:, side_index] >= self._static_target_hold_frames
+            self._static_target_hold_active[:, side_index] |= self._stable_arm_targets[:, side_index] & (reached | settled)
+
+        joint_hold_mask = torch.zeros_like(self._last_arm_velocity_targets, dtype=torch.bool)
+        for side_index, side in enumerate(("left", "right")):
+            joint_hold_mask[:, self._joint_indices_by_side[side]] = self._static_target_hold_active[:, side_index, None]
+        if self._cached_ik_joint_positions is None or not bool(torch.all(joint_hold_mask)):
+            candidate = self._compute_ik_solutions()
             if self._cached_ik_joint_positions is None:
-                self._cached_ik_joint_positions = measured_joint_positions.detach().clone()
+                self._cached_ik_joint_positions = candidate.detach().clone()
             else:
-                self._cached_ik_joint_positions[can_start_hold] = measured_joint_positions[can_start_hold].detach()
-            for controller_index in torch.nonzero(can_start_hold, as_tuple=False).flatten().tolist():
-                self._ik_controllers[controller_index].reset_command_state()
-        self._static_target_hold_active |= can_start_hold
-        hold_mask = self._static_target_hold_active
-        if self._cached_ik_joint_positions is not None and bool(torch.all(hold_mask)):
-            ik_joint_positions = self._cached_ik_joint_positions.clone()
-        else:
-            candidate_ik_joint_positions = self._compute_ik_solutions()
-            if self._cached_ik_joint_positions is None:
-                self._cached_ik_joint_positions = candidate_ik_joint_positions.detach().clone()
-            else:
-                update_mask = ~hold_mask
-                self._cached_ik_joint_positions[update_mask] = candidate_ik_joint_positions[update_mask].detach()
-            ik_joint_positions = torch.where(
-                hold_mask[:, None],
-                self._cached_ik_joint_positions,
-                candidate_ik_joint_positions,
-            )
+                for side_index, side in enumerate(("left", "right")):
+                    indices = self._joint_indices_by_side[side]
+                    if not indices:
+                        continue
+                    solution_change = torch.abs(candidate[:, indices] - self._cached_ik_joint_positions[:, indices]).amax(dim=1)
+                    settled = self._stable_arm_targets[:, side_index] & (solution_change <= self._static_joint_tolerance_rad)
+                    self._settled_solution_frame_count[:, side_index] = torch.where(
+                        settled, self._settled_solution_frame_count[:, side_index] + 1, 0,
+                    )
+                self._cached_ik_joint_positions = torch.where(
+                    joint_hold_mask, self._cached_ik_joint_positions, candidate.detach(),
+                )
+        # Preserve the solved command on hold, rather than repeatedly replacing
+        # it with measured joints. PhysX can finish tracking that fixed command.
+        ik_joint_positions = self._cached_ik_joint_positions.clone()
+        for env_index, controller in enumerate(self._ik_controllers):
+            if bool(torch.any(joint_hold_mask[env_index])):
+                controller.hold_command_joints(
+                    joint_hold_mask[env_index].cpu().numpy(),
+                    ik_joint_positions[env_index].cpu().numpy(),
+                )
         current_joint_positions = self._asset.data.joint_pos[:, self._isaaclab_controlled_joint_ids]
         joint_delta = ik_joint_positions - current_joint_positions
 
         velocity_targets = joint_delta / max(float(self._sim_dt), 1.0e-6)
         velocity_targets *= self._velocity_feedforward_gain
         velocity_targets *= self._velocity_feedforward_activation
+        velocity_targets.masked_fill_(joint_hold_mask, 0.0)
         if self._velocity_feedforward_deadband_rad > 0.0:
             velocity_targets = torch.where(
                 torch.abs(joint_delta) >= self._velocity_feedforward_deadband_rad,
@@ -444,7 +462,8 @@ class ESROBOPinkInverseKinematicsAction(PinkInverseKinematicsAction):
         for controller_index in controller_indices:
             self._ik_controllers[int(controller_index)].reset_command_state()
         self._has_previous_frame_positions = False
-        self._static_target_frame_count.zero_()
+        self._pose_stability.reset()
+        self._settled_solution_frame_count.zero_()
         self._static_target_hold_active.zero_()
         self._cached_ik_joint_positions = None
         self._velocity_feedforward_activation.zero_()

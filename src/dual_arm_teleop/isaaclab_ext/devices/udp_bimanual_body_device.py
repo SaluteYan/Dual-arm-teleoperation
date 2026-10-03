@@ -24,6 +24,12 @@ import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.devices.device_base import DeviceBase, DeviceCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from dual_arm_teleop.wrist_pose import (
+    compose_hand_rotation,
+    forearm_rotation,
+    hand_rotation_in_mounting_frame,
+    rotation_distance_rad,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -399,6 +405,7 @@ class UdpBimanualBodyDevice(DeviceBase):
         self._hand_orientation_sample_times_s: dict[str, float] = {}
         self._hand_arm_reference_rotations: dict[str, np.ndarray] = {}
         self._hand_imu_reference_delta_matrices: dict[str, np.ndarray] = {}
+        self._hand_relative_rotations: dict[str, np.ndarray] = {}
         self._wrist_arm_reference_rotations: dict[str, np.ndarray] = {}
         self._hand_skeleton_arm_reference_rotations: dict[str, np.ndarray] = {}
         self._hand_skeleton_visual_rotations: dict[str, np.ndarray] = {}
@@ -707,6 +714,7 @@ class UdpBimanualBodyDevice(DeviceBase):
         self._held_segment_directions = {"left": {}, "right": {}}
         self._hand_arm_reference_rotations.clear()
         self._hand_imu_reference_delta_matrices.clear()
+        self._hand_relative_rotations.clear()
         self._wrist_arm_reference_rotations.clear()
         self._hand_skeleton_arm_reference_rotations.clear()
         self._hand_skeleton_visual_rotations.clear()
@@ -1961,7 +1969,11 @@ class UdpBimanualBodyDevice(DeviceBase):
             if not self._printed_hand_imu_stale and self._print_calibration_events:
                 print(
                     f"[bodytracking_udp] Hand IMU orientation stream stale for {age:.2f}s; "
-                    "falling back to the arm-parent wrist orientation.",
+                    + (
+                        "keeping the last relative wrist rotation while the forearm follows."
+                        if self._hand_imu_relative_to_arm_frame
+                        else "falling back to the arm-parent wrist orientation."
+                    ),
                     flush=True,
                 )
                 self._printed_hand_imu_stale = True
@@ -1980,11 +1992,12 @@ class UdpBimanualBodyDevice(DeviceBase):
         disabled.
         """
         rotation_delta = self._hand_imu_delta_matrix_for_target(target_side)
-        synchronized_arm_rotation = self._synchronized_human_forearm_rotation(
-            target_side
-        )
-        if synchronized_arm_rotation is not None:
-            current_arm_rotation = synchronized_arm_rotation
+        if not self._hand_orientation_is_forearm_relative:
+            synchronized_arm_rotation = self._synchronized_human_forearm_rotation(
+                target_side
+            )
+            if synchronized_arm_rotation is not None:
+                current_arm_rotation = synchronized_arm_rotation
         if (
             rotation_delta is None
             or not self._hand_imu_relative_to_arm_frame
@@ -2008,6 +2021,29 @@ class UdpBimanualBodyDevice(DeviceBase):
         if self._hand_orientation_is_forearm_relative:
             return hand_delta_world.astype(np.float32)
         return (parent_delta_world.T @ hand_delta_world).astype(np.float32)
+
+    def _relative_hand_rotation_local(
+        self, side: str, current_arm_rotation: np.ndarray | None,
+    ) -> np.ndarray:
+        """Cache wrist motion in hand-mounting axes, also across IMU dropouts.
+
+        Robot targets update this once per advance. Display only reads the same
+        result, rather than locking a second reference or interpreting IMU again.
+        """
+        relative_world = self._hand_imu_relative_rotation_world(side, current_arm_rotation)
+        previous = self._hand_relative_rotations.get(side)
+        if relative_world is None:
+            return previous if previous is not None else np.eye(3, dtype=np.float32)
+        initial_rotation = (
+            self._initial_left_pose_matrix if side == "left" else self._initial_right_pose_matrix
+        )[:3, :3]
+        local = hand_rotation_in_mounting_frame(relative_world, initial_rotation)
+        # Anchor the deadband at the accepted orientation: slow genuine wrist
+        # motion accumulates and releases it; tiny stationary IMU noise does not.
+        if previous is not None and rotation_distance_rad(previous, local) < math.radians(0.35):
+            return previous
+        self._hand_relative_rotations[side] = local
+        return local
 
     def _synchronized_human_forearm_rotation(
         self, target_side: str
@@ -2092,7 +2128,16 @@ class UdpBimanualBodyDevice(DeviceBase):
             target_side
         )
         if current_arm_rotation is not None and arm_mounting_reference is None:
-            arm_mounting_reference = current_arm_rotation.copy()
+            shoulder, elbow, wrist, _ = self._robot_arm_reference(target_side)
+            # The robot rest arm is almost straight: its roll is unobservable.
+            # Transport the observed plane instead of choosing an arbitrary
+            # global normal that could mount a palm backwards.
+            arm_mounting_reference = _forearm_points_to_rotation(
+                {"shoulder": shoulder, "elbow": elbow, "wrist": wrist},
+                current_arm_rotation[:, 2],
+            )
+            if arm_mounting_reference is None:
+                arm_mounting_reference = current_arm_rotation.copy()
             self._wrist_arm_reference_rotations[target_side] = arm_mounting_reference
 
         arm_follow_rotation = initial_rotation.copy()
@@ -2103,20 +2148,12 @@ class UdpBimanualBodyDevice(DeviceBase):
                 @ initial_rotation
             ).astype(np.float32)
 
-        relative_rotation_world = self._hand_imu_relative_rotation_world(
-            target_side, current_arm_rotation
-        )
-        if relative_rotation_world is not None and arm_mounting_reference is not None:
-            arm_reference = self._hand_arm_reference_rotations[target_side]
-            relative_rotation_local = (
-                arm_reference.T @ relative_rotation_world @ arm_reference
+        if self._hand_imu_relative_to_arm_frame and current_arm_rotation is not None:
+            relative_local = self._relative_hand_rotation_local(target_side, current_arm_rotation)
+            return compose_hand_rotation(
+                current_arm_rotation, arm_mounting_reference,
+                initial_rotation, relative_local,
             )
-            return (
-                current_arm_rotation
-                @ relative_rotation_local
-                @ arm_mounting_reference.T
-                @ initial_rotation
-            ).astype(np.float32)
 
         if rotation_delta is not None:
             return (rotation_delta @ initial_rotation).astype(np.float32)
@@ -2532,6 +2569,14 @@ class UdpBimanualBodyDevice(DeviceBase):
         initial_mounting_rotation: np.ndarray,
     ) -> np.ndarray:
         """Follow the displayed forearm while preserving the initial hand mounting."""
+        if self._hand_skeleton_frame == "robot_hand_local":
+            pose = self._previous_left_pose if side == "left" else self._previous_right_pose
+            initial = (
+                self._initial_left_pose_matrix if side == "left" else self._initial_right_pose_matrix
+            )[:3, :3]
+            # Same world orientation as the wrist command; only the skeleton's
+            # position is attached to the displayed human wrist.
+            return (_quat_wxyz_to_matrix(pose[3:]) @ initial.T @ initial_mounting_rotation).astype(np.float32)
         key = f"visual_{side}"
         current_arm_rotation = _forearm_points_to_rotation(
             body_arm_points, self._forearm_plane_normals.get(key)
@@ -2545,23 +2590,11 @@ class UdpBimanualBodyDevice(DeviceBase):
             arm_reference = current_arm_rotation.copy()
             self._hand_skeleton_arm_reference_rotations[side] = arm_reference
 
-        relative_rotation_world = self._hand_imu_relative_rotation_world(
-            side, current_arm_rotation
-        )
-        if relative_rotation_world is not None:
-            imu_arm_reference = self._hand_arm_reference_rotations.get(side)
-            if imu_arm_reference is not None:
-                relative_rotation_local = (
-                    imu_arm_reference.T
-                    @ relative_rotation_world
-                    @ imu_arm_reference
-                )
-                return (
-                    current_arm_rotation
-                    @ relative_rotation_local
-                    @ arm_reference.T
-                    @ initial_mounting_rotation
-                ).astype(np.float32)
+        if self._hand_imu_relative_to_arm_frame:
+            return compose_hand_rotation(
+                current_arm_rotation, arm_reference, initial_mounting_rotation,
+                self._hand_relative_rotations.get(side, np.eye(3, dtype=np.float32)),
+            )
 
         rotation = (
             current_arm_rotation @ arm_reference.T @ initial_mounting_rotation
@@ -3410,40 +3443,8 @@ def _forearm_points_to_rotation(
     points: dict[str, np.ndarray],
     previous_plane_normal: np.ndarray | None = None,
 ) -> np.ndarray | None:
-    """Build the wrist parent frame from the forearm axis and elbow bend plane."""
-    forearm_axis = _normalize_vector(points["wrist"] - points["elbow"])
-    upper_arm_axis = _normalize_vector(points["elbow"] - points["shoulder"])
-    if forearm_axis is None:
-        return None
-
-    plane_normal = None
-    if upper_arm_axis is not None:
-        plane_normal = _normalize_vector(np.cross(upper_arm_axis, forearm_axis))
-    if plane_normal is None and previous_plane_normal is not None:
-        plane_normal = _normalize_vector(
-            previous_plane_normal
-            - float(np.dot(previous_plane_normal, forearm_axis)) * forearm_axis
-        )
-    if plane_normal is None:
-        for reference in (
-            np.asarray([0.0, 0.0, 1.0], dtype=np.float32),
-            np.asarray([0.0, 1.0, 0.0], dtype=np.float32),
-            np.asarray([1.0, 0.0, 0.0], dtype=np.float32),
-        ):
-            plane_normal = _normalize_vector(np.cross(reference, forearm_axis))
-            if plane_normal is not None:
-                break
-    if plane_normal is None:
-        return None
-    if previous_plane_normal is not None and np.dot(plane_normal, previous_plane_normal) < 0.0:
-        plane_normal = -plane_normal
-
-    bend_axis = _normalize_vector(np.cross(forearm_axis, plane_normal))
-    if bend_axis is None:
-        return None
-    return np.stack([forearm_axis, bend_axis, plane_normal], axis=1).astype(
-        np.float32
-    )
+    """Use the same stable parent-frame math for targets and visualization."""
+    return forearm_rotation(points, previous_plane_normal)
 
 
 def _invert_pose_matrix(matrix: np.ndarray) -> np.ndarray:

@@ -54,6 +54,8 @@ pyproject.toml                      Python 包元数据
 - 小角度段方向处理改为连续自适应混合，不再在角度阈值内完全锁住，因此快动作不会因死区累计后跳变。
 - SenseGlove UDP 包同时携带当前绝对 IMU 四元数、每次启动标定的中性四元数、固定设备轴转换后的局部旋转和单调采样时间。实时接收端优先使用固定轴转换结果，并将 PICO 前臂位置插值到 IMU 采样时刻后组合手腕姿态；前臂接近伸直时沿用上一帧弯曲平面，避免坐标系翻转。旧手部录制没有轴元数据时，会自动走原有接收端固定映射兼容路径。
 - Nova 2 的异常 `w=z` 四元数修复会在两个可能的 `w` 符号中选择与上一帧连续的解。
+- 手腕姿态统一采用 `R_hand_world = R_forearm_current @ R_forearm_rest.T @ R_hand_rest @ R_wrist_local`：前臂带动整只手，IMU 只改变手相对于前臂的姿态。初始挂载使用机器人中立前臂，而不是把任意第一帧人体前臂误当成机器人中立位；中立前臂接近伸直时，将首次有效前臂法向投影到中立前臂，避免引入任意掌心翻转。弯肘小于 8 度时沿用前一帧法向，在 8 到 20 度间平滑恢复弯曲平面。IMU 小于 0.35 度的变化保持上一有效腕部旋转，累计的真实腕部运动仍会释放保持；IMU 暂时中断时保留最后的相对腕部姿态，不突然回中。
+- 双臂的静止保持分别判断位置和旋转，使用相对固定锚点的累计变化，容差默认为 3 mm / 1 度、连续 12 帧。零姿态权重的肘部不参与姿态到位判断；到位或 IK 解已收敛后保持已求解的关节目标并清零对应臂的速度前馈，不反复用实测关节覆盖目标。单侧运动只释放该侧保持。默认腕部位置/姿态任务权重调整为 `64 / 8`，兼顾空间位置和朝向。
 - `dex_vector` 默认采用官方 dex-retargeting teleop 配置风格，只优化手腕到五个指尖的向量，避免 ESROBO 欠驱动手的 Mimic 关节被逐节指骨目标过度约束；同时用张手/握拳标定计算每指闭合进度，以较低权重约束对应 MCP 主动关节覆盖相同运动比例。仍保留方向残差、Huber 鲁棒权重、上一帧正则与软关节限位，并默认每帧一次 warm-start 迭代。可用 `--dex-vector-set dense` 复现旧的逐节指骨目标，或用 `--dex-curl-weight 0` 关闭闭合进度辅助项。
 
 纯数学回归和录制数据对比：
@@ -72,13 +74,31 @@ cd ~/PhdResearch/DualArmTeleopration
 
 ## 手部可视化挂载（骨架手 vs 机器人手）
 
-本仓库默认将第一帧有效的机器人目标前臂姿态锁定为手腕随动零位。此时左右灵巧手保持机器人 USD 初始姿态，掌心朝向身体中间；之后手腕姿态按照目标前臂相对该零位的旋转随动，并在此基础上叠加 SenseGlove IMU 相对前臂旋转。显示用双手骨架直接读取同一画面中人体骨架的肩/肘/腕，锁定首帧前臂坐标系后逐帧应用 `R_current_forearm @ R_start_forearm.T`，因此双手会和显示的双臂严格随动；SenseGlove IMU 只叠加手相对前臂的旋转（`ESROBO_HAND_SKELETON_PALMS_FACE_EACH_OTHER=0`、`ESROBO_HAND_SKELETON_LEFT_LOCAL_ROTATION_DEG=0`）。如需复现旧版动态“掌心相对”显示，可设 `ESROBO_HAND_SKELETON_PALMS_FACE_EACH_OTHER=1`。
+本仓库使用机器人中立前臂与 USD 初始手掌位姿建立挂载关系。手腕世界姿态先随当前前臂旋转，再叠加 SenseGlove 的局部腕部旋转。默认显示用双手骨架的位置挂载到同一画面的人体腕点，姿态直接读取同一帧机器人手腕目标；不再由显示层重复计算另一套 IMU 参考或前臂旋转，因此骨架手与机器人目标具有相同世界朝向（`ESROBO_HAND_SKELETON_PALMS_FACE_EACH_OTHER=0`、`ESROBO_HAND_SKELETON_LEFT_LOCAL_ROTATION_DEG=0`）。如需复现旧版动态“掌心相对”显示，可设 `ESROBO_HAND_SKELETON_PALMS_FACE_EACH_OTHER=1`。实际机器人手与目标之间仍可能存在 IK/动力学跟随误差。
 
 SenseGlove 左右手是具有相反手性的点云。显示层会额外反射左手局部掌面法向轴，再挂载到机器人左腕；该修正使左右骨架手互为镜像，同时不改变发送给 `dex_vector` 的手指关节重定向数据。
 
 实时 Nova 2 数据使用固定的手套局部轴定义，不再根据每次手腕动作拟合轴基。每次启动只记录 `q_neutral`，并在手套中立局部坐标中计算 `inverse(q_neutral) * q_current`。右手固定设备矩阵保持单位阵；根据左手实机逐轴验证，左手设备轴为 `Y=左右摆动`、`Z=上下摆动`、`X=掌心翻转`，因此固定矩阵使用 `[[0,1,0],[0,0,1],[1,0,0]]` 转换到统一语义顺序。左手局部轴符号为 `[+1, -1, +1]`，右手为 `[-1, -1, +1]`；左手侧偏符号与右手不同，以匹配镜像腕部的拇指/小指侧运动方向。左右手现在都直接对完整的中立位相对旋转执行一次固定轴映射；左手不再拆分和重组 swing/twist，从而避免大角度组合旋转因乘法顺序产生额外姿态偏移。`ESROBO_HAND_IMU_LEFT_AXIS_ORDER`、`ESROBO_HAND_IMU_*_LOCAL_AXIS_SIGNS` 和 `ESROBO_HAND_IMU_RIGHT_SWAP_XY` 仅供缺少固定轴元数据的旧录制或旧 UDP 包兼容使用。
 
 联合回放默认使用 `--hand-imu-mode relative`，适用于双臂和手套分别录制的文件：手套 IMU 被解释为腕部相对动作，不会反向抵消当前双臂的前臂随动。只有身体与手套在同一次动作中同步采集时才使用 `--hand-imu-mode synchronized`；使用 `--hand-imu-mode disabled` 可仅检查前臂带动双手的效果。
+
+联合回放会自动用历史录制中保存的 `senseglove_raw` IMU 和标定中立四元数重建当前固定轴映射，同时保持录制的手指关节目标。已带固定轴元数据或缺少原始 IMU 的包保持兼容；使用 `--preserve-recorded-hand-imu` 可对比旧映射。
+
+无界面回归工具 `scripts/evaluate_esrobo_arm_hand_tracking.py` 通过本机 UDP、实际设备解析、Pink 和 PhysX 回放上述完整录制，并在末尾追加 4 秒固定输入，输出逐帧数据和 `.summary.json`。调度使用仿真时间，因此该工具验证跟随与静止稳定性，不测实时端到端延迟：
+
+```bash
+cd ~/PhdResearch/DualArmTeleopration
+unset LD_LIBRARY_PATH PYTHONPATH
+source ~/anaconda3/etc/profile.d/conda.sh
+conda activate env_isaaclab
+export TERM=xterm-256color
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+./external/IsaacLab/isaaclab.sh -p scripts/evaluate_esrobo_arm_hand_tracking.py \
+  --headless --device cuda:0 --enable_pinocchio \
+  --output recordings/wrist_tracking_eval/current.json
+```
+
+追加 `--tail-mode hand_dropout` 可验证身体持续发送、手套 IMU 停止时手掌不会突然回中。原始数据、测量结果和日志保留在本地 `recordings/` 中。
 
 ## 大文件说明
 

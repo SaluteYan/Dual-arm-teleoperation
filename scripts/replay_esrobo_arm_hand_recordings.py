@@ -33,6 +33,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--print-interval", type=float, default=1.0)
     parser.add_argument(
+        "--preserve-recorded-hand-imu", action="store_true",
+        help="Keep legacy recorded IMU axes instead of upgrading raw samples to current fixed axes.",
+    )
+    parser.add_argument(
         "--hand-imu-mode",
         choices=("relative", "synchronized", "disabled"),
         default="relative",
@@ -46,7 +50,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def _load_packets(
-    path: Path, expected_packet_type: str
+    path: Path, expected_packet_type: str, rebuild_hand_imu: bool = True,
 ) -> tuple[dict[str, Any] | None, list[tuple[float, dict[str, Any]]]]:
     header: dict[str, Any] | None = None
     packets: list[tuple[float, dict[str, Any]]] = []
@@ -69,12 +73,66 @@ def _load_packets(
                 raise ValueError(
                     f"{path}: line {line_number} is not an esrobo_hand_joints packet"
                 )
+            if expected_packet_type == "hand" and rebuild_hand_imu:
+                packet = _upgrade_hand_imu_packet(header, packet, item.get("senseglove_raw"))
             packets.append((float(item["t_rel_s"]), packet))
     if not packets:
         raise ValueError(
             f"recording contains no {expected_packet_type} packets: {path}"
         )
     return header, packets
+
+
+def _upgrade_hand_imu_packet(
+    header: dict[str, Any] | None, packet: dict[str, Any], raw: Any,
+) -> dict[str, Any]:
+    """Rebuild legacy IMU deltas in hand-local axes without changing finger targets."""
+    if packet.get("hand_orientation_axis_calibrated") or not isinstance(raw, dict):
+        return packet
+    calibration = header.get("calibration", {}) if isinstance(header, dict) else {}
+    if not isinstance(calibration, dict):
+        return packet
+    neutrals = calibration.get("imu_neutral", {})
+    if not isinstance(neutrals, dict):
+        return packet
+    from senseglove_ros_to_esrobo_hand_bridge import (
+        apply_imu_axis_calibration, build_fixed_imu_axis_calibration,
+        orientation_delta_local_wxyz,
+    )
+
+    axes = build_fixed_imu_axis_calibration()
+    deltas, absolute, neutral = {}, {}, {}
+    source_mapping = packet.get("retargeting", {})
+    if not isinstance(source_mapping, dict):
+        source_mapping = {}
+    for side in ("left", "right"):
+        source = str(source_mapping.get(f"robot_{side}_source", f"{side}_glove"))
+        source_side = "right" if "right" in source else "left"
+        raw_side = raw.get(source_side, {})
+        if not isinstance(raw_side, dict):
+            return packet
+        current = raw_side.get("imu_orientation_corrected_wxyz")
+        reference = neutrals.get(source_side)
+        delta = orientation_delta_local_wxyz(current, reference)
+        if delta is None:
+            return packet
+        deltas[side] = apply_imu_axis_calibration(delta, axes[source_side], target_side=side)
+        absolute[side] = list(current)
+        neutral[side] = list(reference)
+    result = dict(packet)
+    result.update(
+        hand_orientation_deltas=deltas,
+        hand_orientation_delta_order="wxyz",
+        hand_orientation_axis_calibrated=True,
+        hand_orientation_source_frame="calibrated_robot_hand_local_axes",
+        hand_orientations_absolute=absolute,
+        hand_orientation_neutral=neutral,
+        hand_orientation_retargeting={
+            "method": "recorded_raw_imu_with_current_fixed_axes",
+            "axis_calibration_source": "current_fixed",
+        },
+    )
+    return result
 
 
 def _file_sha256(path: Path) -> str:
@@ -169,7 +227,10 @@ def _replay_packet(
             hand_imu_mode == "relative"
         )
 
-    if stream == "hand" and hand_imu_mode != "disabled" and hand_imu_neutral:
+    if (
+        stream == "hand" and hand_imu_mode != "disabled" and hand_imu_neutral
+        and not replay.get("hand_orientation_axis_calibrated")
+    ):
         deltas = replay.get("hand_orientation_deltas")
         if isinstance(deltas, dict):
             absolute: dict[str, list[float]] = {}
@@ -189,6 +250,12 @@ def _replay_packet(
                 replay["hand_orientations_absolute"] = absolute
                 replay["hand_orientation_neutral"] = neutral
                 replay["hand_orientation_sample_monotonic_ns"] = sample_times
+    if stream == "hand" and hand_imu_mode != "disabled":
+        deltas = replay.get("hand_orientation_deltas", {})
+        if isinstance(deltas, dict):
+            replay["hand_orientation_sample_monotonic_ns"] = {
+                side: replay_time_ns for side in deltas if side in ("left", "right")
+            }
     return replay
 
 
@@ -242,7 +309,8 @@ def main(argv: list[str]) -> int:
             args.body_record_path.expanduser(), "body"
         )
         hand_header, hand_packets = _load_packets(
-            args.hand_record_path.expanduser(), "hand"
+            args.hand_record_path.expanduser(), "hand",
+            rebuild_hand_imu=not args.preserve_recorded_hand_imu,
         )
         hand_imu_neutral = None
         if isinstance(hand_header, dict):
